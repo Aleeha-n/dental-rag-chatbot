@@ -44,7 +44,7 @@ def chat(req: ChatRequest):
         print("Chat error:", repr(exc))
         raise HTTPException(
             status_code=500,
-            detail="Sorry, abhi jawab nahi de saka. Please clinic ko 0300-1234567 par call karein.",
+            detail="Sorry, I can't answer right now. Please call the clinic at 0300-1234567.",
         )
 
 

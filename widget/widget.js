@@ -10,8 +10,8 @@
   }
   var TITLE = (script && script.getAttribute("data-title")) || "BrightSmile Assistant";
   var GREETING =
-    "Assalam o Alaikum! Main BrightSmile Dental Clinic ka assistant hoon. " +
-    "Fees, timings, treatments ya appointment ke bare mein pooch sakte hain.";
+    "Hello! I'm the BrightSmile Dental Clinic assistant. " +
+    "Ask me about fees, timings, treatments, or book an appointment.";
   var history = [];
   var busy = false;
 
@@ -42,11 +42,11 @@
     "#send{border:0;background:#0f766e;color:#fff;border-radius:20px;padding:0 16px;cursor:pointer;font-size:14px}" +
     "#send:disabled{opacity:.5;cursor:default}" +
     "</style>" +
-    '<button id="bubble" aria-label="Chat kholein">&#128172;</button>' +
+    '<button id="bubble" aria-label="Open chat">&#128172;</button>' +
     '<div id="panel" role="dialog" aria-label="Chat">' +
-    '<div id="head"><span></span><button id="close" aria-label="Band karein">&times;</button></div>' +
+    '<div id="head"><span></span><button id="close" aria-label="Close chat">&times;</button></div>' +
     '<div id="msgs"></div>' +
-    '<form id="form"><input id="input" type="text" maxlength="500" placeholder="Apna sawal likhein..." autocomplete="off">' +
+    '<form id="form"><input id="input" type="text" maxlength="500" placeholder="Type your question..." autocomplete="off">' +
     '<button id="send" type="submit">Send</button></form></div>';
 
   var $ = function (id) { return root.getElementById(id); };
@@ -92,7 +92,7 @@
     })
       .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
       .then(function (res) {
-        var reply = res.ok ? res.d.answer : (res.d.detail || "Kuch masla ho gaya.");
+        var reply = res.ok ? res.d.answer : (res.d.detail || "Something went wrong.");
         typing.remove();
         addMsg(reply, "bot");
         if (res.ok) {
@@ -102,7 +102,7 @@
       })
       .catch(function () {
         typing.remove();
-        addMsg("Jawab dene mein der lag rahi hai ya connection ka masla hai. Dobara try karein, ya clinic ko 0300-1234567 par call karein.", "bot");
+        addMsg("The reply is taking too long or the connection failed. Please try again, or call the clinic at 0300-1234567.", "bot");
       })
       .finally(function () {
         clearTimeout(timer);

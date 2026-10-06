@@ -23,6 +23,8 @@ FALLBACK_MODELS = [
 ]
 CHAT_MODELS = [CHAT_MODEL] + [m for m in FALLBACK_MODELS if m != CHAT_MODEL]
 TOP_K = int(os.getenv("TOP_K", "4"))
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # booking workflow; na ho to booking tool band rehta hai
+N8N_TIMEOUT_SEC = 60
 EMBED_DIMS = 768
 DB_DIR = BASE_DIR / "chroma_db"
 COLLECTION = "clinic_kb"
@@ -34,16 +36,25 @@ RULES:
    about fees, timings, doctors or policies. Never invent prices, names or times.
 2. If the answer is not in the clinic information, say clearly that you don't have that
    information, and suggest calling or WhatsApp 0300-1234567. Do not guess.
-3. Reply in the same language and script the patient used: English, Urdu script, or
-   Roman Urdu (Urdu written in English letters). Keep a warm, polite tone.
+3. Always reply in clear, simple English, even if the patient writes in another
+   language. Keep a warm, polite tone.
 4. Keep answers short and clear (2-5 sentences). Use a short list only for prices or steps.
 5. You are not a doctor. Do not diagnose or prescribe. For symptoms, share only the
    general guidance present in the clinic information and recommend a check-up. For severe
    pain, swelling or bleeding, tell the patient to call the clinic right away.
 6. Prices are starting rates; mention that the final fee is confirmed after examination
    when you quote fees.
-7. To book an appointment, ask the patient to share name, phone number and preferred
-   day/time, or to call/WhatsApp 0300-1234567.
+7. BOOKING: if the patient wants an appointment, collect their full name and phone number
+   (ask for any that is missing; never invent them). Once you have both, call the
+   clinic_booking tool with the patient's latest message copied word for word. The booking
+   system replies with available slots or a confirmation. Relay that reply faithfully
+   (keep slot numbers, dates and times exactly as given) in English, and
+   never claim an appointment is booked unless the tool reply says it is confirmed.
+   If a booking is already in progress (slots were offered in the conversation) and the
+   patient answers with a slot ("1", "2", "10 baje wala"), call clinic_booking again with
+   the same name and phone and that answer. If the tool returns an error, apologise and
+   give the clinic phone 0300-1234567. If the tool is not available, ask the patient to
+   call or WhatsApp 0300-1234567.
 8. Politely refuse unrelated requests (general knowledge, other businesses, coding, etc.)
    and bring the conversation back to the clinic.
 """
@@ -100,7 +111,7 @@ _cooldown = {}
 QUOTA_COOLDOWN_SEC = 30 * 60
 
 
-def generate_with_fallback(prompt):
+def generate_with_fallback(contents, tools=None):
     """Models ki list mein se pehla jo chale usse jawab lo.
 
     - busy / slow (503, timeout): agla model try karo
@@ -115,9 +126,15 @@ def generate_with_fallback(prompt):
             return with_retry(
                 lambda: get_client().models.generate_content(
                     model=model,
-                    contents=prompt,
+                    contents=contents,
                     config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT, temperature=0.2
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.2,
+                        tools=tools,
+                        # function call hum khud manually chalate hain
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        ),
                     ),
                 ),
                 delays=(0, 2),
@@ -138,8 +155,55 @@ def generate_with_fallback(prompt):
                 continue
             raise
     if last is None:  # sab models cooldown par hain
-        raise RuntimeError("Sab models ka quota khatam hai. Thori der baad try karein.")
+        raise RuntimeError("All models are over quota. Please try again in a little while.")
     raise last
+
+
+BOOKING_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="clinic_booking",
+            description=(
+                "Send the patient's message to the clinic's appointment booking system. "
+                "It offers free slots, or confirms the slot the patient chose. Call it only "
+                "when you know both the patient's name and phone number."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "name": types.Schema(type=types.Type.STRING, description="Patient's full name"),
+                    "phone": types.Schema(type=types.Type.STRING, description="Patient's phone number"),
+                    "message": types.Schema(
+                        type=types.Type.STRING,
+                        description="The patient's latest message, copied word for word",
+                    ),
+                },
+                required=["name", "phone", "message"],
+            ),
+        )
+    ]
+)
+
+
+def run_booking(args):
+    """n8n booking workflow ko call karo. Hamesha dict wapas deta hai (kabhi crash nahi)."""
+    name = str(args.get("name") or "").strip()
+    phone = "".join(ch for ch in str(args.get("phone") or "") if ch.isdigit() or ch == "+")
+    message = str(args.get("message") or "").strip()
+    if not name or len(phone) < 10 or not message:
+        return {"error": "Name or a valid phone number is missing. Ask the patient for it."}
+    try:
+        r = httpx.post(
+            N8N_WEBHOOK_URL,
+            json={"name": name, "phone": phone, "message": message},
+            timeout=N8N_TIMEOUT_SEC,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return {"reply": data.get("reply_message", ""), "status": data.get("status", "")}
+    except Exception as exc:  # noqa: BLE001
+        print(f"n8n booking call fail: {type(exc).__name__}: {exc}")
+        return {"error": "Booking system is not reachable right now."}
 
 
 def get_collection(create=False):
@@ -184,6 +248,27 @@ def answer(message, history=None):
         f"Patient: {message}\nAssistant:"
     )
 
-    resp = generate_with_fallback(prompt)
+    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+    tools = [BOOKING_TOOL] if N8N_WEBHOOK_URL else None
+
+    resp = None
+    for _ in range(3):  # max 3 round: sawal -> tool -> jawab
+        resp = generate_with_fallback(contents, tools)
+        calls = resp.function_calls or []
+        if not calls:
+            break
+        contents.append(resp.candidates[0].content)  # model ka call (signatures ke saath)
+        parts = []
+        for fc in calls:
+            if fc.name == "clinic_booking":
+                result = run_booking(dict(fc.args or {}))
+            else:
+                result = {"error": "Unknown tool."}
+            parts.append(types.Part.from_function_response(name=fc.name, response=result))
+        contents.append(types.Content(role="user", parts=parts))
+
+    text = (resp.text or "").strip() if resp else ""
+    if not text:
+        text = "Sorry, I couldn't complete that right now. Please call or WhatsApp the clinic at 0300-1234567."
     sources = sorted({c["source"] for c in chunks})
-    return {"answer": (resp.text or "").strip(), "sources": sources}
+    return {"answer": text, "sources": sources}
